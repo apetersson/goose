@@ -1,17 +1,22 @@
+use opentelemetry::logs::{AnyValue, LogRecord};
 use opentelemetry::trace::TracerProvider;
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{global, Key, KeyValue};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
+use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::logs::{LogProcessor, SdkLogRecord, SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::metrics::{SdkMeterProvider, Temporality};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::resource::{EnvResourceDetector, TelemetryResourceDetector};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
+use std::cell::RefCell;
 use std::env;
 use std::sync::Mutex;
+use tracing::field::{Field, Visit};
 use tracing::{Level, Metadata};
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::filter::FilterFn;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer as _;
 
 pub type OtlpTracingLayer =
@@ -114,6 +119,75 @@ fn create_resource() -> Resource {
     builder.build()
 }
 
+// Propagates session.id from tracing spans to OTel log records via a thread-local,
+// similar to opentelemetry-appender-tracing's experimental_span_attributes feature.
+// SessionIdBridge must be inner to the bridge layer so its on_event fires first.
+
+thread_local! {
+    static CURRENT_SESSION_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+struct SessionId(String);
+
+#[derive(Debug)]
+pub struct SessionIdBridge;
+
+impl<S> tracing_subscriber::Layer<S> for SessionIdBridge
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct V(Option<String>);
+        impl Visit for V {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "session.id" {
+                    self.0 = Some(value.to_string());
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "session.id" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut v = V(None);
+        attrs.record(&mut v);
+        if let Some(sid) = v.0 {
+            if let Some(span) = ctx.span(id) {
+                span.extensions_mut().insert(SessionId(sid));
+            }
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let sid = ctx.event_scope(event).and_then(|scope| {
+            scope
+                .from_root()
+                .find_map(|span| span.extensions().get::<SessionId>().map(|s| s.0.clone()))
+        });
+        CURRENT_SESSION_ID.with(|cell| *cell.borrow_mut() = sid);
+    }
+}
+
+impl LogProcessor for SessionIdBridge {
+    fn emit(&self, record: &mut SdkLogRecord, _: &opentelemetry::InstrumentationScope) {
+        CURRENT_SESSION_ID.with(|cell| {
+            if let Some(ref id) = *cell.borrow() {
+                record.add_attribute(Key::new("session.id"), AnyValue::from(id.clone()));
+            }
+        });
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        Ok(())
+    }
+}
+
 /// Initializes all OTLP signal layers (traces, metrics, logs) and propagation.
 /// Returns boxed layers ready to add to a subscriber.
 pub fn init_otlp_layers(
@@ -131,8 +205,10 @@ pub fn init_otlp_layers(
     if let Ok(layer) = create_otlp_metrics_layer() {
         layers.push(layer.with_filter(create_otlp_metrics_filter()).boxed());
     }
-    if let Ok(layer) = create_otlp_logs_layer() {
-        layers.push(layer.with_filter(create_otlp_logs_filter()).boxed());
+    if let Ok(bridge) = create_otlp_logs_layer() {
+        // SessionIdBridge must be inner (added first) so on_event runs before bridge
+        layers.push(SessionIdBridge.boxed());
+        layers.push(bridge.with_filter(create_otlp_logs_filter()).boxed());
     }
 
     if !layers.is_empty() {
@@ -227,6 +303,7 @@ fn create_otlp_logs_layer() -> OtlpResult<OtlpLogsLayer> {
                 .with_http()
                 .build()?;
             SdkLoggerProvider::builder()
+                .with_log_processor(SessionIdBridge)
                 .with_batch_exporter(exporter)
                 .with_resource(resource)
                 .build()
@@ -234,6 +311,7 @@ fn create_otlp_logs_layer() -> OtlpResult<OtlpLogsLayer> {
         ExporterType::Console => {
             let exporter = opentelemetry_stdout::LogExporter::default();
             SdkLoggerProvider::builder()
+                .with_log_processor(SessionIdBridge)
                 .with_simple_exporter(exporter)
                 .with_resource(resource)
                 .build()

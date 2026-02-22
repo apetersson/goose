@@ -1,12 +1,18 @@
 use goose::conversation::message::Message;
 use goose::model::ModelConfig;
+use goose::otel::otlp::SessionIdBridge;
 use goose::providers::api_client::{ApiClient, AuthMethod};
 use goose::providers::base::Provider;
 use goose::providers::openai::OpenAiProvider;
 use goose::session_context::SESSION_ID_HEADER;
+use opentelemetry::logs::AnyValue;
+use opentelemetry::Key;
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tracing_subscriber::prelude::*;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -102,6 +108,30 @@ async fn make_request(provider: &dyn Provider, session_id: &str) {
         )
         .await
         .unwrap();
+}
+
+#[test]
+fn test_session_id_propagates_to_log_records() {
+    let exporter = InMemoryLogExporter::default();
+    let provider = SdkLoggerProvider::builder()
+        .with_log_processor(SessionIdBridge)
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let bridge = OpenTelemetryTracingBridge::new(&provider);
+    let subscriber = tracing_subscriber::registry()
+        .with(SessionIdBridge)
+        .with(bridge);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let span = tracing::info_span!("test", session.id = "abc-123");
+    let _enter = span.enter();
+    tracing::info!("hello");
+
+    provider.force_flush().unwrap();
+    let logs = exporter.get_emitted_logs().unwrap();
+    assert_eq!(logs.len(), 1);
+    let attrs: Vec<(Key, AnyValue)> = logs[0].record.attributes_iter().cloned().collect();
+    assert!(attrs.contains(&(Key::new("session.id"), AnyValue::String("abc-123".into()))));
 }
 
 #[tokio::test]
