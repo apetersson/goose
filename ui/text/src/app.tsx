@@ -181,7 +181,7 @@ function HeaderBar({
 function ToolCallBlock({ title, width }: { title: string; width: number }) {
   return (
     <Box
-      marginLeft={3}
+      marginLeft={4}
       marginY={0}
       paddingX={1}
       borderStyle="round"
@@ -199,8 +199,8 @@ function ToolCallBlock({ title, width }: { title: string; width: number }) {
 
 function UserMessage({ text, width }: { text: string; width: number }) {
   return (
-    <Box flexDirection="column" width={width}>
-      <Box paddingLeft={1} paddingY={0}>
+    <Box flexDirection="column" width={width} paddingLeft={2}>
+      <Box>
         <Text color={CRANBERRY_BRIGHT} bold>
           {"❯ "}
         </Text>
@@ -214,7 +214,7 @@ function UserMessage({ text, width }: { text: string; width: number }) {
 
 function AgentMessage({ text, width }: { text: string; width: number }) {
   return (
-    <Box paddingLeft={3} paddingRight={2} width={width}>
+    <Box paddingLeft={4} paddingRight={2} width={width}>
       <Text color={PARCHMENT}>{text}</Text>
     </Box>
   );
@@ -234,7 +234,7 @@ function PermissionPrompt({
   return (
     <Box
       flexDirection="column"
-      marginLeft={3}
+      marginLeft={4}
       marginY={0}
       paddingX={2}
       paddingY={1}
@@ -369,26 +369,53 @@ function SplashScreen({
   );
 }
 
+function QueuedMessageBlock({ text, width }: { text: string; width: number }) {
+  return (
+    <Box flexDirection="column" width={width} paddingLeft={2}>
+      <Box>
+        <Text color={SLATE} dimColor>
+          {"❯ "}
+        </Text>
+        <Text color={SLATE} dimColor>
+          {text}
+        </Text>
+        <Text color={AUTUMN_GOLD} dimColor>
+          {" "}(queued)
+        </Text>
+      </Box>
+    </Box>
+  );
+}
+
 function InputBar({
   width,
   input,
   onChange,
   onSubmit,
+  queued,
 }: {
   width: number;
   input: string;
   onChange: (v: string) => void;
   onSubmit: (v: string) => void;
+  queued: boolean;
 }) {
   return (
     <Box flexDirection="column" width={width}>
       <HRule width={width} color={DEEP_SLATE} />
-      <Box paddingLeft={1} paddingY={0}>
+      <Box paddingLeft={2}>
         <Text color={CRANBERRY_BRIGHT} bold>
           {"❯ "}
         </Text>
         <TextInput value={input} onChange={onChange} onSubmit={onSubmit} />
       </Box>
+      {queued && (
+        <Box paddingLeft={4}>
+          <Text color={AUTUMN_GOLD} dimColor italic>
+            message queued — will send when goose finishes
+          </Text>
+        </Box>
+      )}
     </Box>
   );
 }
@@ -401,7 +428,7 @@ function LoadingIndicator({
   spinIdx: number;
 }) {
   return (
-    <Box paddingLeft={3} marginTop={0}>
+    <Box paddingLeft={4}>
       <Text color={CRANBERRY_BRIGHT}>
         {SPINNER_FRAMES[spinIdx % SPINNER_FRAMES.length]}{" "}
       </Text>
@@ -434,10 +461,13 @@ export default function App({
   const [pendingPermission, setPendingPermission] =
     useState<PendingPermission | null>(null);
   const [permissionIdx, setPermissionIdx] = useState(0);
+  const [queuedMessages, setQueuedMessages] = useState<string[]>([]);
   const clientRef = useRef<GooseClient | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const streamBuf = useRef("");
   const sentInitialPrompt = useRef(false);
+  const queueRef = useRef<string[]>([]);
+  const isProcessingRef = useRef(false);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -491,6 +521,52 @@ export default function App({
     [pendingPermission],
   );
 
+  const processQueue = useCallback(async () => {
+    if (isProcessingRef.current) return;
+    isProcessingRef.current = true;
+
+    while (queueRef.current.length > 0) {
+      const next = queueRef.current.shift()!;
+      setQueuedMessages([...queueRef.current]);
+
+      const client = clientRef.current;
+      const sid = sessionIdRef.current;
+      if (!client || !sid) break;
+
+      setMessages((prev) => [
+        ...prev,
+        { kind: "text" as const, role: "user" as const, text: next },
+      ]);
+      setLoading(true);
+      setStatus("thinking...");
+      streamBuf.current = "";
+
+      try {
+        const result = await client.prompt({
+          sessionId: sid,
+          prompt: [{ type: "text", text: next }],
+        });
+
+        if (streamBuf.current) {
+          appendAgent("");
+        }
+
+        setStatus(
+          result.stopReason === "end_turn"
+            ? "ready"
+            : `stopped: ${result.stopReason}`,
+        );
+      } catch (e: unknown) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+        setStatus(`error: ${errMsg}`);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    isProcessingRef.current = false;
+  }, [appendAgent]);
+
   const sendPrompt = useCallback(
     async (text: string) => {
       const client = clientRef.current;
@@ -525,9 +601,13 @@ export default function App({
         setStatus(`error: ${errMsg}`);
       } finally {
         setLoading(false);
+        // Drain any messages that were queued while we were busy
+        if (queueRef.current.length > 0) {
+          processQueue();
+        }
       }
     },
-    [appendAgent],
+    [appendAgent, processQueue],
   );
 
   useEffect(() => {
@@ -616,9 +696,15 @@ export default function App({
   const handleSubmit = useCallback(
     (value: string) => {
       const trimmed = value.trim();
-      if (!trimmed || loading) return;
+      if (!trimmed) return;
       setInput("");
-      sendPrompt(trimmed);
+
+      if (loading || isProcessingRef.current) {
+        queueRef.current.push(trimmed);
+        setQueuedMessages([...queueRef.current]);
+      } else {
+        sendPrompt(trimmed);
+      }
     },
     [loading, sendPrompt],
   );
@@ -729,8 +815,9 @@ export default function App({
             return (
               <React.Fragment key={i}>
                 {i > 0 && <Box height={1} />}
-                <UserMessage text={msg.text} width={innerWidth} />
                 <HRule width={innerWidth} color={HARBOR_NAVY} />
+                <UserMessage text={msg.text} width={innerWidth} />
+                <Box height={1} />
               </React.Fragment>
             );
           }
@@ -749,14 +836,19 @@ export default function App({
         {loading && !pendingPermission && messages.length > 0 && (
           <LoadingIndicator status={status} spinIdx={spinIdx} />
         )}
+
+        {queuedMessages.map((text, i) => (
+          <QueuedMessageBlock key={`queued-${i}`} text={text} width={innerWidth} />
+        ))}
       </Box>
 
-      {!loading && !pendingPermission && !initialPrompt && (
+      {!pendingPermission && !initialPrompt && (
         <InputBar
           width={innerWidth}
           input={input}
           onChange={setInput}
           onSubmit={handleSubmit}
+          queued={queuedMessages.length > 0}
         />
       )}
     </Box>
